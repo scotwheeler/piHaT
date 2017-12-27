@@ -14,6 +14,7 @@ from os import path, popen
 import scipy.optimize as optimize
 import sqlite3 as sql
 import signal
+import pandas as pd
 
 def connect_db(filename):
     if filename[-3:]!=".db":
@@ -28,7 +29,7 @@ def setup_calibration(filename):
     # add file extension if not there
     if filename[-3:]!=".db":
         filename += ".db"
-    ilename = path.normpath(filename)
+    filename = path.normpath(filename)
     calibration_dir = path.normpath("calibration")
     # create directory if it does not exist
     if not path.exists(calibration_dir):
@@ -53,11 +54,10 @@ def setup_calibration(filename):
                     Tpres FLOAT,
                     Tavg FLOAT,
                     Tpi FLOAT,
-                    Hum FLOAT,
-                    Treal FLOAT,
-                    Hreal FLOAT
+                    Hum FLOAT
                     )
                 """)
+    
     db.commit()
     db.close()       
     
@@ -71,15 +71,67 @@ def recreate_calibration(filename="calibration"):
     db.close()
     setup_calibration(filename)
 
-##def write_to_calibration(That, Tpi, Treal, filename="calibration"):
-##    """Write pihat and input temperature"""
-##    db = connect_db(filename)
-##    datetime = dt.datetime.now()
-##    db.cursor()
-##    values = (datetime, That, Tpi, Treal)
-##    db.execute("INSERT INTO calibration VALUES (?,?,?,?)", values)
-##    db.commit()
-##    db.close()
+def write_to_data(db_file, t_now, temp, humid, pressure,
+                          htemp, ptemp, avg_piT, chiptemp):
+    """
+    Write pihat and input temperature
+    """
+    db = sql.connect(db_file)
+    datetime = dt.datetime.now()
+    db.cursor()
+    values = (t_now, temp, humid, pressure,
+              htemp, ptemp, avg_piT, chiptemp)
+    db.execute("INSERT INTO data VALUES (?,?,?,?,?,?,?,?)", values)
+    db.commit()
+    db.close()
+    print("Write to database successful")
+
+def read_all_calibration(filename="calibration"):
+    """Read all calibration data"""
+
+def setup_output_db(prefix="data"):
+    """Initial setup of the output db"""
+    # add date to filename
+    today = dt.date.today()
+    year = today.year
+    month = today.month
+    day = today.day
+    filename = prefix + str(day) + str(month) + str(year) +"_0.db"
+    filename = path.normpath(filename)
+    directory = path.normpath("data")
+    # create directory if it does not exist
+    if not path.exists(directory):
+        makedirs(directory)
+    # create filepath
+    filepath = path.join(directory, filename)
+
+    # create unique database
+    while path.isfile(filepath):
+        filename = (filename[:-4]
+                    + str(int(filename[-4]) + 1)
+                    + ".db")
+        filepath = path.join(directory, filename)
+    
+    db = sql.connect(filepath)  # create db
+    
+    db.cursor()
+    db.execute("""
+                CREATE TABLE IF NOT EXISTS data (
+                    time TIMESTAMP,
+                    temp FLOAT,
+                    humidity FLOAT,
+                    pressure FLOAT,
+                    rawThum FLOAT,
+                    "rawTpres" FLOAT,
+                    "rawavgT" FLOAT,
+                    "chipT" FLOAT
+                    )
+                """)
+    db.commit()
+    db.close()       
+    
+    return filepath
+    
 
 def read_all_calibration(filename="calibration"):
     """Read all calibration data"""
@@ -178,7 +230,8 @@ def printenvirodata(senseHat, Tem, Hum, Pres):
     return
 
 
-def run(interval = 30, total_time = 120, display=True):
+def run(interval = 30, total_time = 120, save_data=True,
+        prefix = "data", display=True):
     """
     Run program
 
@@ -190,6 +243,15 @@ def run(interval = 30, total_time = 120, display=True):
     total_time: float.
         Maximum time of experiment
     """
+    if save_data:
+        # setup output db
+        db = setup_output_db(prefix=prefix)
+        csv = db[:-2] + "csv"
+
+    # setup datafram
+    data = pd.DataFrame(columns = ["time", "temp", "humidity", "pressure",
+                                   "rawThum", "rawTpres", "rawavgT", "chipT"])
+        
     # initial run often returns 0
     sense = SenseHat()
     htemp,ptemp,humidity,pressure = getenvirodata(sense) 
@@ -208,6 +270,7 @@ def run(interval = 30, total_time = 120, display=True):
     
     while ((time.time()-start_time) < total_time):
         t_now = time.time()
+        dt_t_now = dt.datetime.fromtimestamp(t_now)
         # measure temperature
         htemp,ptemp,humidity,pressure = getenvirodata(sense) 
         chiptemp = getpitemp()
@@ -216,8 +279,21 @@ def run(interval = 30, total_time = 120, display=True):
         print("T: " + str(temp))
         humid = np.around(Hfit(humidity),1)
         print("H: " + str(humid))
+        data = data.append({"time": dt_t_now,
+                     "temp": temp,
+                     "humidity": humid,
+                     "pressure": pressure,
+                     "rawThum": htemp,
+                     "rawTpres": ptemp,
+                     "rawavgT": avg_piT,
+                     "chipT": chiptemp}, ignore_index=True)
         if display:
             printenvirodata(sense, temp, humid, pressure)
+        if save_data:
+            # update database
+            write_to_data(db, dt_t_now, temp, humid, pressure,
+                          htemp, ptemp, avg_piT, chiptemp)
+            data.to_csv(csv, index=False)
         time.sleep(interval - (time.time() - t_now))
 
 def setup_run():
@@ -236,7 +312,7 @@ def setup_run():
                              
     while True:
         try:
-            interval = input("Intervale(s): ")
+            interval = input("Interval (s): ")
             if interval == "":
                 interval = 30
             interval= int(interval)
@@ -246,8 +322,21 @@ def setup_run():
             break
         except:
             continue
+        
+    save_data = "a"
+    while not (save_data.lower() in ["y", "n"]):
+        save_data = input("Would you like to save? (y/n) ")
+    if (save_data.lower() == "y"):
+        save_data = True
+        prefix = input("Save file prefix: ")
+        if prefix == "":
+            prefix = "data"
+    else:
+        save_data = False
+        prefix = "data"
                              
-    run(interval = interval, total_time = total_time, display=True)
+    run(interval = interval, total_time = total_time,
+        display=True, save_data=save_data, prefix=prefix)
 
 if __name__ == "__main__":
 ##    [x, y] = readAvgTempCalibration()
@@ -255,3 +344,4 @@ if __name__ == "__main__":
 ##    print(Tfit(x[0]))
 #    run()
     setup_run()
+
